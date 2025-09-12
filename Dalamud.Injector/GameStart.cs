@@ -2,8 +2,15 @@ using System;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
+
+using PeNet;
+using PeNet.Header.Pe;
 
 using Serilog;
 
@@ -28,7 +35,7 @@ namespace Dalamud.Injector
         /// <returns>The started process.</returns>
         /// <exception cref="Win32Exception">Thrown when a win32 error occurs.</exception>
         /// <exception cref="GameStartException">Thrown when the process did not start correctly.</exception>
-        public static Process LaunchGame(string workingDir, string exePath, string arguments, bool dontFixAcl, Action<Process> beforeResume, bool waitForGameWindow = true)
+        public static Process LaunchGame(string workingDir, string exePath, string arguments, bool dontFixAcl, Action<Process> beforeResume, bool waitForGameWindow = true, bool disableAslr = false)
         {
             Process process = null;
 
@@ -92,19 +99,34 @@ namespace Dalamud.Injector
 
                 try
                 {
-                    if (!PInvoke.CreateProcess(
-                            null,
-                            $"\"{exePath}\" {arguments}",
-                            ref lpProcessAttributes,
-                            IntPtr.Zero,
-                            false,
-                            PInvoke.CREATE_SUSPENDED,
-                            IntPtr.Zero,
-                            workingDir,
-                            ref lpStartupInfo,
-                            out lpProcessInformation))
+                    if (disableAslr)
                     {
-                        throw new Win32Exception(Marshal.GetLastWin32Error());
+                        NtCreateProcessEx(
+                            workingDir,
+                            exePath,
+                            arguments,
+                            psecDesc,
+                            out lpProcessInformation.hProcess,
+                            out lpProcessInformation.hThread);
+                    }
+                    else
+                    {
+
+                        Log.Information("Launching old style");
+                        if (!PInvoke.CreateProcess(
+                                null,
+                                $"\"{exePath}\" {arguments}",
+                                ref lpProcessAttributes,
+                                IntPtr.Zero,
+                                false,
+                                PInvoke.CREATE_SUSPENDED,
+                                IntPtr.Zero,
+                                workingDir,
+                                ref lpStartupInfo,
+                                out lpProcessInformation))
+                        {
+                            throw new Win32Exception(Marshal.GetLastWin32Error());
+                        }
                     }
                 }
                 finally
@@ -176,6 +198,185 @@ namespace Dalamud.Injector
             }
 
             return process;
+        }
+
+        public static FileStream? CloneAndModifyForASLR(string exePath, out string newPath)
+        {
+            var pe = new PeFile(exePath);
+            if (pe.ImageNtHeaders == null)
+            {
+                newPath = exePath;
+                return null;
+            }
+
+            pe.ImageNtHeaders.OptionalHeader.DllCharacteristics &= ~DllCharacteristicsType.DynamicBase;
+            pe.ImageNtHeaders.FileHeader.Characteristics &= ~FileCharacteristicsType.RelocsStripped;
+            var peSpan = pe.RawFile.AsSpan(0, pe.RawFile.Length);
+
+            var tempPath = Path.Join(Path.GetTempPath(), "ffxiv_dx11.exe");
+            using var wf = File.Open(tempPath, FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite);
+
+            wf.Write(peSpan);
+            newPath = tempPath;
+            return wf;
+        }
+
+        public static void NtCreateProcessEx(
+            string workingDir, string exePath, string arguments, IntPtr pSecDesc, out nint hProcess, out nint hThread)
+        {
+
+            // Make sure we hold the handle to this long enough to
+            using var exeFile = CloneAndModifyForASLR(exePath, out var tempFilename);
+            // This uses an NT-style path, which starts with \??\
+            using var sourceFilename = PInvoke.UNICODE_STRING.Create(@"\??\" + tempFilename);
+            using var attr = new AllocPtr<PInvoke.OBJECT_ATTRIBUTES>();
+            unsafe
+            {
+                attr.Value->Length = 48;
+                attr.Value->ObjectName = sourceFilename.Ptr;
+            }
+
+            int status;
+            var iosb = default(PInvoke.IO_STATUS_BLOCK);
+            IntPtr hFile;
+            // // TODO: const
+            // status = PInvoke.NtOpenFile(
+            //     out hFile,
+            //     0x00100001,
+            //     attr.Ptr,
+            //     ref iosb,
+            //     1,
+            //     0x20);
+            // if (status != 0) throw new Win32Exception(status);
+            hFile = exeFile.SafeFileHandle.DangerousGetHandle();
+
+            // TODO: const
+            status = PInvoke.NtCreateSection(
+                out var hSection,
+                PInvoke.SECTION_ALL_ACCESS,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                2,
+                0x01000000,
+                hFile);
+            if (status != 0) throw new Win32Exception(status);
+
+            using var procAttr = new AllocPtr<PInvoke.OBJECT_ATTRIBUTES>();
+            unsafe
+            {
+                procAttr.Value->Length = 48;
+                procAttr.Value->SecurityDescriptor = pSecDesc;
+            }
+
+            status = PInvoke.NtCreateProcessEx(
+                out hProcess,
+                0x1FFFFFU,
+                procAttr.Ptr,
+                -1, // Current Process
+                0,
+                hSection,
+                0,
+                0,
+                0);
+            if (status != 0) throw new Win32Exception(status);
+
+            PInvoke.CloseHandle(hSection);
+
+            PInvoke.PROCESS_BASIC_INFORMATION processInfo = default;
+            status = PInvoke.NtQueryInformationProcess(
+                hProcess,
+                0, // TODO: const
+                out processInfo,
+                (uint)Marshal.SizeOf<PInvoke.PROCESS_BASIC_INFORMATION>(),
+                IntPtr.Zero
+            );
+            if (status != 0) throw new Win32Exception(status);
+
+            using var imageName = PInvoke.UNICODE_STRING.Create(exePath);
+            using var workingDirUS = PInvoke.UNICODE_STRING.Create(workingDir);
+            using var cmdLine = PInvoke.UNICODE_STRING.Create($"\"{exePath}\" {arguments}");
+            using var windowTitle = PInvoke.UNICODE_STRING.Create("ffxiv_dx11.exe");
+            // TODO: What's up with this value- is this always right?
+            using var desktopInfo = PInvoke.UNICODE_STRING.Create("Winsta0\\Default");
+            using var shellInfo = PInvoke.UNICODE_STRING.Create("\0");
+
+            status = PInvoke.RtlCreateProcessParametersEx(
+                out var procParamsPtr,
+                imageName,
+                workingDirUS,
+                workingDirUS,
+                cmdLine,
+                0, // this loads the current env
+                windowTitle,
+                desktopInfo,
+                shellInfo,
+                IntPtr.Zero,
+                1); // TODO: Const
+            if (status != 0) throw new Win32Exception(status);
+
+            unsafe
+            {
+                var procParams = (PInvoke.RTL_USER_PROCESS_PARAMETERS*)procParamsPtr;
+                var paramsSize = (uint)(procParams->MaximumLength + procParams->EnvironmentSize);
+                var paramsRemote = IntPtr.Zero;
+
+                PInvoke.RtlDeNormalizeProcessParams(procParamsPtr);
+
+                status = PInvoke.NtAllocateVirtualMemory(
+                    hProcess,
+                    ref paramsRemote,
+                    0,
+                    ref paramsSize,
+                    0x3000, // TODO: Const
+                    0x4 // TODO: Const
+                );
+                if (status != 0) throw new Win32Exception(status);
+
+                procParams->Environment += paramsRemote - procParamsPtr;
+
+                status = PInvoke.NtWriteVirtualMemory(
+                    hProcess,
+                    paramsRemote,
+                    procParamsPtr,
+                    paramsSize,
+                    IntPtr.Zero
+                );
+                if (status != 0) throw new Win32Exception(status);
+
+                status = PInvoke.RtlDestroyProcessParameters(procParamsPtr);
+                if (status != 0) throw new Win32Exception(status);
+
+                status = PInvoke.NtWriteVirtualMemory(
+                    hProcess,
+                    processInfo.PebBaseAddress + Marshal.OffsetOf<PInvoke.PEB>("ProcessParameters"),
+                    (IntPtr)(&paramsRemote),
+                    (ulong)Marshal.SizeOf<IntPtr>(),
+                    IntPtr.Zero
+                );
+                if (status != 0) throw new Win32Exception(status);
+            }
+
+            status = PInvoke.NtQueryInformationProcess(
+                hProcess,
+                37, // TODO: Const
+                out PInvoke.SECTION_IMAGE_INFORMATION imageInfo,
+                (uint)Marshal.SizeOf<PInvoke.SECTION_IMAGE_INFORMATION>(),
+                IntPtr.Zero);
+            if (status != 0) throw new Win32Exception(status);
+
+            status = PInvoke.NtCreateThreadEx(
+                out hThread,
+                2097151U,
+                IntPtr.Zero,
+                hProcess,
+                imageInfo.TransferAddress,
+                IntPtr.Zero,
+                1, // TODO: Const
+                imageInfo.ZeroBits,
+                imageInfo.CommittedStackSize,
+                imageInfo.MaximumStackSize,
+                IntPtr.Zero);
+            if (status != 0) throw new Win32Exception(status);
         }
 
         /// <summary>
@@ -303,7 +504,6 @@ namespace Dalamud.Injector
                     throw new Win32Exception(Marshal.GetLastWin32Error());
                 }
             }
-
             PInvoke.CloseHandle(tokenHandle);
         }
 
@@ -436,6 +636,24 @@ namespace Dalamud.Injector
                 SecurityImpersonation,
                 SecurityDelegation,
             }
+
+            [Flags]
+            public enum SECTION_ACCESS_RIGHTS : uint
+            {
+                SECTION_QUERY = 0x0001,
+                SECTION_MAP_WRITE = 0x0002,
+                SECTION_MAP_READ = 0x0004,
+                SECTION_MAP_EXECUTE = 0x0008,
+                SECTION_EXTEND_SIZE = 0x0010,
+                STANDARD_RIGHTS_REQUIRED = 0x000F0000,
+            }
+
+            public const SECTION_ACCESS_RIGHTS SECTION_ALL_ACCESS = SECTION_ACCESS_RIGHTS.STANDARD_RIGHTS_REQUIRED |
+                                                                    SECTION_ACCESS_RIGHTS.SECTION_QUERY |
+                                                                    SECTION_ACCESS_RIGHTS.SECTION_MAP_WRITE |
+                                                                    SECTION_ACCESS_RIGHTS.SECTION_MAP_READ |
+                                                                    SECTION_ACCESS_RIGHTS.SECTION_MAP_EXECUTE |
+                                                                    SECTION_ACCESS_RIGHTS.SECTION_EXTEND_SIZE;
             #endregion
 
             #region Methods
@@ -479,6 +697,112 @@ namespace Dalamud.Injector
                string lpCurrentDirectory,
                [In] ref STARTUPINFO lpStartupInfo,
                out PROCESS_INFORMATION lpProcessInformation);
+
+            [DllImport("ntdll.dll", CharSet = CharSet.Unicode, SetLastError = true, CallingConvention = CallingConvention.StdCall)]
+            public static extern int NtOpenFile(
+                out IntPtr handle,
+                uint access,
+                IntPtr objectAttributes,
+                ref IO_STATUS_BLOCK ioStatus,
+                uint share,
+                uint openOptions);
+
+            [DllImport("ntdll.dll")]
+            public static extern int NtCreateSection(
+                out IntPtr hSection,
+                SECTION_ACCESS_RIGHTS DesiredAccess,
+                IntPtr objectAttributes, // left as IntPtr because we don't use
+                IntPtr MaximumSize, // left as IntPtr because we don't use
+                UInt32 sectionPageProtection,
+                UInt32 allocationAttributes,
+                IntPtr fileHandle
+            );
+
+            [DllImport("ntdll.dll")]
+            public static extern int NtCreateProcessEx(
+                out IntPtr hProcess,
+                uint DesiredAccess,
+                IntPtr objectAttributes, // IntPtr because we don't need it
+                IntPtr parentProcess,
+                uint flags,
+                IntPtr sectionHandle,
+                IntPtr debugPort,
+                IntPtr tokenHandle,
+                uint reserved
+            );
+
+            [DllImport("ntdll.dll", SetLastError = true, CharSet = CharSet.Auto)]
+            public static extern int NtQueryInformationProcess(
+                IntPtr hProcess,
+                int ProcessInformationClass,
+                out PROCESS_BASIC_INFORMATION processInformation,
+                uint ProcessInformationLength,
+                IntPtr returnLength
+            );
+
+            [DllImport("ntdll.dll", SetLastError = true, CharSet = CharSet.Auto)]
+            public static extern int NtQueryInformationProcess(
+                IntPtr hProcess,
+                int ProcessInformationClass,
+                out SECTION_IMAGE_INFORMATION processInformation,
+                uint ProcessInformationLength,
+                IntPtr returnLength
+            );
+
+            [DllImport("ntdll.dll")]
+            public static extern int RtlCreateProcessParametersEx(
+                out IntPtr pProcessParameters, // outputs a RTL_USER_PROCESS_PARAMETERS*
+                IntPtr ImagePathName,
+                IntPtr DllPath,
+                IntPtr CurrentDirectory,
+                IntPtr CommandLine,
+                IntPtr Environment,
+                IntPtr WindowTitle,
+                IntPtr DesktopInfo,
+                IntPtr ShellInfo,
+                IntPtr RuntimeData,
+                uint Flags
+            );
+
+            [DllImport("ntdll.dll")]
+            public static extern IntPtr RtlDeNormalizeProcessParams(IntPtr ProcessParameters);
+
+            [DllImport("ntdll.dll")]
+            public static extern int RtlDestroyProcessParameters(IntPtr ProcessParameters);
+
+            [DllImport("ntdll.dll")]
+            public static extern int NtAllocateVirtualMemory(
+                IntPtr hProcess,
+                ref IntPtr BaseAddress,
+                uint ZeroBits,
+                ref uint RegionSize,
+                uint AllocationType,
+                uint Protect
+            );
+
+            [DllImport("ntdll.dll")]
+            public static extern int NtWriteVirtualMemory(
+                IntPtr hProcess,
+                IntPtr BaseAddress,
+                IntPtr Buffer,
+                ulong BufferSize,
+                IntPtr NumberOfBytesWritten // we don't care
+            );
+
+            [DllImport("ntdll.dll")]
+            public static extern int NtCreateThreadEx(
+                    out IntPtr threadHandle,
+                    uint desiredAccess,
+                    IntPtr objectAttributes,
+                    IntPtr processHandle,
+                    IntPtr startRoutine,
+                    IntPtr argument,
+                    uint createFlags,
+                    nuint zeroBits,
+                    nuint stackSize,
+                    nuint maximumStackSize,
+                    IntPtr attributeList
+            );
 
             [DllImport("kernel32.dll", SetLastError = true)]
             public static extern bool CloseHandle(IntPtr hObject);
@@ -636,6 +960,62 @@ namespace Dalamud.Injector
                 public UInt32 dwThreadId;
             }
 
+            [StructLayout(LayoutKind.Explicit, Size = 48)]
+            public struct PROCESS_BASIC_INFORMATION
+            {
+                [FieldOffset(0)]
+                public int ExitStatus;
+                [FieldOffset(8)]
+                public IntPtr PebBaseAddress; // PEB*
+                [FieldOffset(0x10)]
+                public nuint AffinityMask;
+                [FieldOffset(0x18)]
+                public int BasePriority;
+                [FieldOffset(0x20)]
+                public IntPtr UniqueProcessId;
+                [FieldOffset(0x28)]
+                public IntPtr InheritedFromUniqueProcessId;
+            }
+
+            // We don't need everything on this
+            [StructLayout(LayoutKind.Explicit, Size = 64)]
+            public struct SECTION_IMAGE_INFORMATION
+            {
+                [FieldOffset(0)]
+                public IntPtr TransferAddress;
+
+                [FieldOffset(8)]
+                public UInt32 ZeroBits;
+
+                [FieldOffset(0x10)]
+                public UIntPtr MaximumStackSize;
+
+                [FieldOffset(0x18)]
+                public UIntPtr CommittedStackSize;
+            }
+
+            // This struct is huge, but we're only going to add the fields we care about
+            [StructLayout(LayoutKind.Explicit, Size = 1992)]
+            public struct PEB
+            {
+                [FieldOffset(32)]
+                public IntPtr ProcessParameters; // RTL_USER_PROCESS_PARAMETERS
+            }
+
+            // This struct is huge, but we're only going to add the fields we care about
+            [StructLayout(LayoutKind.Explicit, Size = 1088)]
+            public struct RTL_USER_PROCESS_PARAMETERS
+            {
+                [FieldOffset(0)]
+                public uint MaximumLength;
+                [FieldOffset(4)]
+                public uint Length;
+                [FieldOffset(128)]
+                public IntPtr Environment;
+                [FieldOffset(1008)]
+                public IntPtr EnvironmentSize;
+            }
+
             [StructLayout(LayoutKind.Sequential)]
             public struct SECURITY_ATTRIBUTES
             {
@@ -673,7 +1053,97 @@ namespace Dalamud.Injector
                 [MarshalAs(UnmanagedType.ByValArray, SizeConst = 1)]
                 public LUID_AND_ATTRIBUTES[] Privileges;
             }
+
+            [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode, Pack = 8, Size=16)]
+            public struct UNICODE_STRING
+            {
+                public ushort Length;
+                public ushort MaximumLength;
+                public IntPtr Buffer;
+
+                public static unsafe AllocPtr<UNICODE_STRING> Create(string source)
+                {
+                    var strBufLen = source.Length * 2;
+                    var str = (UNICODE_STRING*)Marshal.AllocHGlobal(Marshal.SizeOf<UNICODE_STRING>() + strBufLen);
+                    str->Buffer = (IntPtr)str + Marshal.SizeOf<UNICODE_STRING>();
+                    str->Length = str->MaximumLength = (ushort)strBufLen;
+                    Encoding.Unicode.GetBytes(source, new Span<byte>((void*)str->Buffer, strBufLen));
+                    return str!;
+                }
+            }
+
+            [StructLayout(LayoutKind.Explicit, Size = 16)]
+            public struct IO_STATUS_BLOCK
+            {
+                [FieldOffset(0)]
+                public uint Status;
+                [FieldOffset(8)]
+                public IntPtr information;
+            }
+
+            [StructLayout(LayoutKind.Explicit, Size = 48)]
+            public struct OBJECT_ATTRIBUTES()
+            {
+                [FieldOffset(0)]
+                public Int32 Length = Marshal.SizeOf<OBJECT_ATTRIBUTES>();
+                [FieldOffset(8)]
+                public IntPtr RootDirectory;
+                [FieldOffset(0x10)]
+                public IntPtr ObjectName;
+                [FieldOffset(0x18)]
+                public uint Attributes;
+                [FieldOffset(0x20)]
+                public IntPtr SecurityDescriptor;
+                [FieldOffset(0x28)]
+                public IntPtr SecurityQualityOfService;
+            }
+
             #endregion
+        }
+
+        public class AllocPtr<T> : IDisposable
+            where T : unmanaged
+        {
+            public readonly IntPtr Ptr;
+
+            private readonly bool owned = true;
+            private bool disposed;
+
+            public unsafe T* Value => (T*)this.Ptr;
+
+            public unsafe AllocPtr()
+            {
+                this.Ptr = Marshal.AllocHGlobal(Marshal.SizeOf<T>());
+                *this.Value = default;
+            }
+
+            public unsafe AllocPtr(T* ptr, bool takeOwnership = true)
+                : this((IntPtr)ptr, takeOwnership)
+            {
+            }
+
+            public AllocPtr(IntPtr ptr, bool takeOwnership = true)
+            {
+                this.Ptr = ptr;
+                this.owned = takeOwnership;
+            }
+
+            public static unsafe implicit operator AllocPtr<T>(T* ptr) => new(ptr);
+
+            public static unsafe implicit operator T*(AllocPtr<T> ptr) => (T*)ptr.Ptr;
+
+            public static implicit operator IntPtr(AllocPtr<T> ptr) => ptr.Ptr;
+
+            /// <inheritdoc/>
+            public void Dispose()
+            {
+                if (this.disposed) return;
+                this.disposed = true;
+                if (this.owned)
+                {
+                    Marshal.FreeHGlobal(this.Ptr);
+                }
+            }
         }
     }
 }

@@ -662,6 +662,7 @@ namespace Dalamud.Injector
             var withoutDalamud = false;
             var noFixAcl = false;
             var waitForGameWindow = true;
+            var disableAslr = false;
             var encryptArguments = false;
 
             var parsingGameArgument = false;
@@ -716,6 +717,10 @@ namespace Dalamud.Injector
                 else if (args[i] == "--")
                 {
                     parsingGameArgument = true;
+                }
+                else if (args[i] == "--no-aslr")
+                {
+                    disableAslr = true;
                 }
                 else
                 {
@@ -923,7 +928,8 @@ namespace Dalamud.Injector
                         Log.Verbose("RewriteRemoteEntryPointW called!");
                     }
                 },
-                waitForGameWindow);
+                waitForGameWindow,
+                disableAslr);
 
             Log.Verbose("Game process started with PID {0}", process.Id);
 
